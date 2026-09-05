@@ -23,13 +23,47 @@ if [ -n "$SHORTCUTS_VDF" ] && grep -qF "$LEGACY_WRAPPER" "$SHORTCUTS_VDF" 2>/dev
   echo "Existing Steam shortcut uses legacy wrapper — preserving it to keep AppID + controller layout stable."
 fi
 
-if [ ! -d "$VIBELIGHT_DIR/.git" ]; then
+checkout_error() {
+  echo "ERROR: $* No reset or cleanup was performed. Resolve the checkout manually, then rerun." >&2
+  exit 1
+}
+
+# Refuse local work, including ignored files that a checkout could overwrite.
+# Inspect every initialized submodule too; Git's parent status can hide their
+# ignored files or be configured to ignore submodule changes entirely.
+require_clean_checkout() {
+  local changes submodules
+  changes=$(git -C "$VIBELIGHT_DIR" status --porcelain --untracked-files=all --ignored --ignore-submodules=none)
+  [ -z "$changes" ] || checkout_error "Vibelight has local changes or untracked/ignored files."
+  submodules=$(git -C "$VIBELIGHT_DIR" submodule status --recursive)
+  if printf '%s\n' "$submodules" | grep -qE '^[+U]'; then
+    checkout_error "A submodule differs from its recorded commit."
+  fi
+  git -C "$VIBELIGHT_DIR" submodule foreach --quiet --recursive '
+    changes=$(git status --porcelain --untracked-files=all --ignored --ignore-submodules=none) || exit 1
+    test -z "$changes"
+  ' || checkout_error "A submodule has local changes or untracked/ignored files."
+}
+
+if [ ! -e "$VIBELIGHT_DIR" ]; then
   echo "Cloning Vibelight (with submodules)..."
-  git clone --recursive "$VIBELIGHT_REPO" "$VIBELIGHT_DIR"
+  git clone --branch master --recursive "$VIBELIGHT_REPO" "$VIBELIGHT_DIR"
 else
-  echo "Vibelight source already present — pulling latest..."
-  git -C "$VIBELIGHT_DIR" fetch origin
-  git -C "$VIBELIGHT_DIR" reset --hard origin/master
+  # Linked worktrees have a .git file rather than a directory.
+  [ -e "$VIBELIGHT_DIR/.git" ] || checkout_error "Vibelight path exists but is not a Git checkout."
+  branch=$(git -C "$VIBELIGHT_DIR" symbolic-ref --quiet --short HEAD) || checkout_error "Vibelight HEAD is detached."
+  [ "$branch" = master ] || checkout_error "Vibelight must be on master (currently $branch)."
+  origin=$(git -C "$VIBELIGHT_DIR" config --get-all remote.origin.url) || checkout_error "Vibelight has no origin."
+  case "$origin" in
+    https://github.com/xenstalker02/Vibelight|https://github.com/xenstalker02/Vibelight.git|git@github.com:xenstalker02/Vibelight.git|ssh://git@github.com/xenstalker02/Vibelight.git) ;;
+    *) checkout_error "Vibelight origin is not the expected repository." ;;
+  esac
+  require_clean_checkout
+  echo "Vibelight source already present — checking safe fast-forward..."
+  git -C "$VIBELIGHT_DIR" fetch --no-recurse-submodules origin refs/heads/master
+  git -C "$VIBELIGHT_DIR" merge-base --is-ancestor HEAD FETCH_HEAD || checkout_error "Vibelight has local commits or divergent history."
+  require_clean_checkout
+  git -C "$VIBELIGHT_DIR" -c merge.autostash=false merge --ff-only --no-autostash FETCH_HEAD
   git -C "$VIBELIGHT_DIR" submodule update --init --recursive
 fi
 
@@ -69,10 +103,12 @@ mkdir -p "$QT_CONF_DIR"
 cp "$VIBELIGHT_DIR/app/qt_qt5.conf" "$QT_CONF_DIR/qt_qt5.conf"
 echo "Qt Material theme config deployed."
 
-# Set PipeWire mic capture volume to 50% to prevent built-in mic from
-# overdriving the Opus encoder. The Deck's built-in mic runs at high gain
-# by default. This is idempotent — safe to run on upgrade too.
-if command -v pactl >/dev/null 2>&1; then
+# Set PipeWire mic capture volume only with explicit installer opt-in.
+# The default source may be an external mic, and microphone streaming is
+# disabled by default; an upgrade must preserve the user's audio settings.
+if [ "${VIBELIGHT_SET_MIC_VOLUME:-0}" != 1 ]; then
+  echo "Microphone volume preserved. To set the current default mic to 50%, rerun with VIBELIGHT_SET_MIC_VOLUME=1."
+elif command -v pactl >/dev/null 2>&1; then
   if pactl set-source-volume @DEFAULT_SOURCE@ 50%; then
     echo "PipeWire mic volume set to 50% to prevent encoder overdrive."
   else
